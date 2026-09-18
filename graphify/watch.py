@@ -283,11 +283,12 @@ def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Pat
 
     try:
         r = _sp.run(
-            cmd, capture_output=True, timeout=5,
+            cmd, capture_output=True, timeout=10,
             cwd=str(cwd) if cwd is not None else None,
         )
         if r.returncode != 0:
-            return {"added": [], "modified": [], "deleted": [], "renamed": []}
+            err_msg = r.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Git diff failed (exit code {r.returncode}): {err_msg}")
 
         tokens = r.stdout.decode("utf-8", errors="replace").split("\0")
         if tokens and tokens[-1] == "":
@@ -333,6 +334,8 @@ def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Pat
                     break
 
         return {"added": added, "modified": modified, "deleted": deleted, "renamed": renamed}
+    except RuntimeError:
+        raise
     except Exception:
         return {"added": [], "modified": [], "deleted": [], "renamed": []}
 

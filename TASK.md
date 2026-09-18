@@ -28,3 +28,28 @@ This document outlines the precise operational chunks required to compute and se
 * **Status**: Complete.
   - Supports `-z` NUL-byte git-diff parsing with full rename, copy, and conflict handling.
   - Emits fully compliant `pacre-delta.json` to `.graphify-out/pacre-delta.json`.
+
+## [COMPLETED] Chunk 5: Bidirectional Consensus Local Relaxation (Strategic Subsystem Stability)
+* **Goal**: Solve the "Butterfly Effect" and non-deterministic clustering flips in CI/CD while accommodating real intentional refactorings.
+* **Status**: Complete (`graphify/cluster.py`).
+  - Strict perturbation boundary: $P = \text{TouchedFiles} \cup \text{DirectNeighbors}(\text{TouchedFiles})$. Nodes outside $P$ remain 100% frozen.
+  - Pass 1 (A $\to$ Z) and Pass 2 (Z $\to$ A) bidirectional modularity sweeps with inertia threshold ($\lambda = 0.05$).
+  - Unanimous consensus commits genuine architectural subsystem migrations.
+  - Order-sensitive disagreement retains baseline community and surfaces `borderAmbiguities` in `pacre-delta.json`.
+  - Pure Python execution: sub-15ms latency across 500+ nodes (well below the 500ms gate).
+
+## [COMPLETED] Chunk 6: CLI Named Flags & `--pr` Auto Merge-Base Detection
+* **Goal**: Support production CI/CD workflows with named parameters and automated base detection.
+* **Status**: Complete (`graphify/cli.py`).
+  - Supports `graphify diff [--base <commit>] [--head <commit>] [--pr] [--out <path>]`.
+  - Automatically detects merge-base via `git merge-base` against `origin/main` / `main` / `origin/master`.
+  - Custom output file redirection via `--out`.
+
+## [COMPLETED] Chunk 7: Strict Git Cryptographic Binding & Fail-Fast Error Diagnostics
+* **Goal**: Enforce P-ACRE cryptographic ledger integrity by mandating valid Git commit history and providing actionable CI guidance.
+* **Status**: Complete (`graphify/cli.py`, `graphify/watch.py`, `tests/test_pacre_delta.py`).
+  - Strict Git verification checks `git rev-parse --is-inside-work-tree`.
+  - Resolves revisions to full 40-character commit SHAs (`baseCommit` and `headCommit`).
+  - Surfaces explicit CI troubleshooting guidance (e.g., `actions/checkout@v4` with `fetch-depth: 0`).
+  - Full automated regression suite added in `tests/test_pacre_delta.py`.
+

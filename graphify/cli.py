@@ -2461,12 +2461,165 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
 
     elif cmd == "diff":
-        base = sys.argv[2] if len(sys.argv) > 2 else None
-        head = sys.argv[3] if len(sys.argv) > 3 else None
+        base = None
+        head = None
+        out_path_arg = None
+        is_pr_mode = False
+
+        i = 2
+        pos_args = []
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg == "--base" and i + 1 < len(sys.argv):
+                base = sys.argv[i + 1]
+                i += 2
+            elif arg.startswith("--base="):
+                base = arg.split("=", 1)[1]
+                i += 1
+            elif arg == "--head" and i + 1 < len(sys.argv):
+                head = sys.argv[i + 1]
+                i += 2
+            elif arg.startswith("--head="):
+                head = arg.split("=", 1)[1]
+                i += 1
+            elif arg == "--out" and i + 1 < len(sys.argv):
+                out_path_arg = Path(sys.argv[i + 1])
+                i += 2
+            elif arg.startswith("--out="):
+                out_path_arg = Path(arg.split("=", 1)[1])
+                i += 1
+            elif arg == "--pr":
+                is_pr_mode = True
+                i += 1
+            else:
+                pos_args.append(arg)
+                i += 1
+
+        if not base and len(pos_args) > 0:
+            base = pos_args[0]
+        if not head and len(pos_args) > 1:
+            head = pos_args[1]
+
         saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
         watch_path = Path(saved.read_text(encoding="utf-8-sig").strip()) if saved.exists() else Path(".")
+
+        # Strict Git Verification: P-ACRE cryptographic ledger requires a valid Git repository
+        import subprocess
+        try:
+            repo_check = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(watch_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if repo_check.returncode != 0:
+                print(
+                    f"error: 'graphify diff' requires a valid Git repository.\n"
+                    f"Reason: P-ACRE cryptographic audit ledger requires Git commit history to bind baseCommit and headCommit.\n\n"
+                    f"CI Troubleshooting:\n"
+                    f"  1. Ensure the workspace was checked out with Git.\n"
+                    f"  2. In GitHub Actions, configure 'fetch-depth: 0' in actions/checkout:\n"
+                    f"       - uses: actions/checkout@v4\n"
+                    f"         with:\n"
+                    f"           fetch-depth: 0\n"
+                    f"  3. In Docker, ensure the .git directory is mounted or copied into the container.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except FileNotFoundError:
+            print(
+                "error: 'git' executable not found on PATH.\n"
+                "P-ACRE requires git to compute architectural diffs and cryptographic audit proofs.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        head_ref = head or "HEAD"
+        head_sha = None
+        try:
+            head_rev = subprocess.run(
+                ["git", "rev-parse", head_ref],
+                cwd=str(watch_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if head_rev.returncode == 0 and head_rev.stdout.strip():
+                head_sha = head_rev.stdout.strip()
+            else:
+                print(
+                    f"error: failed to resolve head revision '{head_ref}'.\n"
+                    f"Git error: {head_rev.stderr.strip()}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except Exception as e:
+            print(f"error: failed executing git rev-parse: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if is_pr_mode and not base:
+            for target_branch in ("origin/main", "main", "origin/master", "master"):
+                try:
+                    res = subprocess.run(
+                        ["git", "merge-base", target_branch, head_sha],
+                        cwd=str(watch_path),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if res.returncode == 0 and res.stdout.strip():
+                        base = res.stdout.strip()
+                        print(f"[graphify diff] Auto-detected PR merge-base against {target_branch}: {base}")
+                        break
+                except Exception:
+                    pass
+            if not base:
+                print(
+                    "error: '--pr' mode could not auto-detect a common merge-base ancestor with main or master.\n"
+                    "CI Troubleshooting:\n"
+                    "  Ensure the base branch is fetched in your CI workflow:\n"
+                    "    git fetch origin main --depth=100\n"
+                    "  Or specify the base commit explicitly via: graphify diff --base <commit>",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        base_ref = base or "HEAD~1"
+        base_sha = None
+        try:
+            base_rev = subprocess.run(
+                ["git", "rev-parse", base_ref],
+                cwd=str(watch_path),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if base_rev.returncode == 0 and base_rev.stdout.strip():
+                base_sha = base_rev.stdout.strip()
+            else:
+                print(
+                    f"error: failed to resolve base revision '{base_ref}'.\n"
+                    f"Git error: {base_rev.stderr.strip()}\n\n"
+                    f"CI Troubleshooting:\n"
+                    f"  In GitHub Actions, shallow clones (default fetch-depth: 1) do not have base commit history.\n"
+                    f"  Configure full commit history via:\n"
+                    f"    - uses: actions/checkout@v4\n"
+                    f"      with:\n"
+                    f"        fetch-depth: 0",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except Exception as e:
+            print(f"error: failed executing git rev-parse for base: {e}", file=sys.stderr)
+            sys.exit(1)
+
         from graphify.watch import _git_diff_changes, _rebuild_code, _compute_ast_delta, _compute_blast_radius
-        changes = _git_diff_changes(base, head, watch_path)
+        try:
+            changes = _git_diff_changes(base_sha, head_sha, watch_path)
+        except RuntimeError as err:
+            print(f"error: {err}", file=sys.stderr)
+            sys.exit(1)
         print("Git Diff Changes:", json.dumps(changes, indent=2))
 
         graph_json_path = watch_path / _GRAPHIFY_OUT / "graph.json"
@@ -2474,7 +2627,8 @@ def dispatch_command(cmd: str) -> None:
 
         renamed_new = [r["new"] for r in changes.get("renamed", [])]
         renamed_old = [r["old"] for r in changes.get("renamed", [])]
-        touched = [watch_path / p for p in changes["added"] + changes["modified"] + renamed_new]
+        touched_files = changes["added"] + changes["modified"] + renamed_new
+        touched = [watch_path / p for p in touched_files]
         if touched:
             print(f"Re-extracting {len(touched)} changed files incrementally...")
             ok = _rebuild_code(watch_path, changed_paths=touched, force=False, no_cluster=True, block_on_lock=True)
@@ -2486,14 +2640,24 @@ def dispatch_command(cmd: str) -> None:
             print("No code changes detected in git diff.")
 
         new_graph = json.loads(graph_json_path.read_text(encoding="utf-8-sig")) if graph_json_path.exists() else None
+
+        # Tier 2: Bidirectional Consensus Local Relaxation
+        from graphify.cluster import bidirectional_consensus_relaxation
+        border_ambiguities = []
+        if new_graph and touched_files:
+            new_graph, border_ambiguities = bidirectional_consensus_relaxation(
+                new_graph, touched_files, inertia=0.05
+            )
+            graph_json_path.write_text(json.dumps(new_graph, indent=2), encoding="utf-8")
+
         ast_delta = _compute_ast_delta(old_graph, new_graph)
         changed_seeds = [s["id"] for s in ast_delta["addedSymbols"]] + [s["id"] for s in ast_delta["removedSymbols"]]
         blast_radius = _compute_blast_radius(new_graph, changed_seeds)
 
         delta_data = {
             "version": "1.0.0",
-            "baseCommit": base or "HEAD~1",
-            "headCommit": head or "HEAD",
+            "baseCommit": base_sha,
+            "headCommit": head_sha,
             "changes": {
                 "filesAdded": changes["added"] + renamed_new,
                 "filesModified": changes["modified"],
@@ -2501,13 +2665,15 @@ def dispatch_command(cmd: str) -> None:
                 "filesRenamed": changes.get("renamed", [])
             },
             "astDelta": ast_delta,
-            "blastRadius": blast_radius
+            "blastRadius": blast_radius,
+            "borderAmbiguities": border_ambiguities
         }
-        delta_path = watch_path / _GRAPHIFY_OUT / "pacre-delta.json"
+        delta_path = out_path_arg if out_path_arg else (watch_path / _GRAPHIFY_OUT / "pacre-delta.json")
         delta_path.parent.mkdir(parents=True, exist_ok=True)
         delta_path.write_text(json.dumps(delta_data, indent=2), encoding="utf-8")
         print(f"Emitted enriched PACRE delta contract to {delta_path}")
         sys.exit(0)
+
 
     elif cmd == "hook-check":
         # Codex Desktop rejects hookSpecificOutput.additionalContext on PreToolUse.

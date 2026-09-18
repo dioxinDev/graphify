@@ -5,7 +5,11 @@ import inspect
 import io
 import json
 import sys
-import networkx as nx
+from pathlib import Path
+try:
+    import networkx as nx
+except ImportError:
+    nx = None
 
 
 def _suppress_output():
@@ -423,3 +427,260 @@ def remap_communities_to_previous(
     for new_cid, nodes in communities.items():
         remapped[new_to_final[new_cid]] = sorted(nodes)
     return dict(sorted(remapped.items(), key=lambda kv: kv[0]))
+
+
+def bidirectional_consensus_relaxation(
+    graph_data: dict,
+    touched_source_files: set[str] | list[str],
+    *,
+    inertia: float = 0.05,
+    resolution: float = 1.0,
+) -> tuple[dict, list[dict[str, any]]]:
+    """Bidirectional Consensus Local Relaxation for incremental community detection (PACRE Tier 2).
+
+    Guarantees 100% bit-exact determinism:
+    1. Bounds perturbation strictly to P = TouchedFiles ∪ DirectNeighbors(TouchedFiles).
+    2. Performs Pass 1 (A->Z) and Pass 2 (Z->A) modularity sweeps with an inertia threshold.
+    3. Commits migrations only when both passes agree (C_fwd == C_rev).
+    4. Freezes order-sensitive conflicts (C_fwd != C_rev) to baseline and records borderAmbiguities.
+    """
+    if not graph_data or not graph_data.get("nodes"):
+        return graph_data, []
+
+    nodes_list = graph_data.get("nodes", [])
+    nodes_by_id = {str(n.get("id")): n for n in nodes_list if n.get("id")}
+    edges_list = graph_data.get("edges") or graph_data.get("links") or []
+
+    # 1. Build adjacency and degree maps
+    adj: dict[str, dict[str, float]] = {nid: {} for nid in nodes_by_id}
+    degree: dict[str, float] = {nid: 0.0 for nid in nodes_by_id}
+    total_m: float = 0.0
+
+    for edge in edges_list:
+        u = str(edge.get("source", ""))
+        v = str(edge.get("target", ""))
+        if u in nodes_by_id and v in nodes_by_id and u != v:
+            w = float(edge.get("weight", 1.0))
+            adj[u][v] = adj[u].get(v, 0.0) + w
+            adj[v][u] = adj[v].get(u, 0.0) + w
+            degree[u] += w
+            degree[v] += w
+            total_m += w
+
+    if total_m <= 0:
+        total_m = max(1.0, float(len(nodes_by_id)))
+
+    # 2. Extract baseline community metadata and labels
+    cid_to_name: dict[int, str] = {}
+    node_to_base_cid: dict[str, int] = {}
+    max_cid = -1
+
+    for nid, node in nodes_by_id.items():
+        raw_cid = node.get("community")
+        cname = node.get("community_name")
+        if raw_cid is not None:
+            try:
+                cid = int(raw_cid)
+                node_to_base_cid[nid] = cid
+                if cid > max_cid:
+                    max_cid = cid
+                if cname and cid not in cid_to_name:
+                    cid_to_name[cid] = str(cname)
+            except (ValueError, TypeError):
+                pass
+
+    # Directory map for sibling fallback
+    dir_to_cids: dict[str, list[int]] = {}
+    for nid, node in nodes_by_id.items():
+        cid = node_to_base_cid.get(nid)
+        s_file = node.get("source_file") or node.get("file")
+        if cid is not None and s_file:
+            parent_dir = str(Path(s_file).parent)
+            dir_to_cids.setdefault(parent_dir, []).append(cid)
+
+    # Assign initial community to nodes that lack one (newly added nodes)
+    initial_comm: dict[str, int] = {}
+    for nid, node in nodes_by_id.items():
+        if nid in node_to_base_cid:
+            initial_comm[nid] = node_to_base_cid[nid]
+        else:
+            # Neighbor majority
+            neighbor_cids: dict[int, float] = {}
+            for neighbor, weight in adj.get(nid, {}).items():
+                ncid = node_to_base_cid.get(neighbor)
+                if ncid is not None:
+                    neighbor_cids[ncid] = neighbor_cids.get(ncid, 0.0) + weight
+            if neighbor_cids:
+                best_ncid = max(sorted(neighbor_cids.keys()), key=lambda c: neighbor_cids[c])
+                initial_comm[nid] = best_ncid
+            else:
+                # Directory sibling majority
+                s_file = node.get("source_file") or node.get("file")
+                parent_dir = str(Path(s_file).parent) if s_file else ""
+                dir_cids = dir_to_cids.get(parent_dir, [])
+                if dir_cids:
+                    from collections import Counter
+                    best_dir_cid = Counter(dir_cids).most_common(1)[0][0]
+                    initial_comm[nid] = best_dir_cid
+                else:
+                    max_cid += 1
+                    initial_comm[nid] = max_cid
+                    cid_to_name[max_cid] = f"Subsystem_{max_cid}"
+
+    # 3. Identify Perturbation Boundary P = TouchedFiles ∪ DirectNeighbors(TouchedFiles)
+    touched_normalized = {
+        str(Path(p)).replace("\\", "/") for p in touched_source_files
+    }
+    touched_nodes: set[str] = set()
+    for nid, node in nodes_by_id.items():
+        s_file = node.get("source_file") or node.get("file")
+        if s_file and str(Path(s_file)).replace("\\", "/") in touched_normalized:
+            touched_nodes.add(nid)
+
+    if not touched_nodes:
+        # Fallback: if filenames didn't match directly, search suffix match
+        for nid, node in nodes_by_id.items():
+            s_file = str(node.get("source_file") or node.get("file") or "").replace("\\", "/")
+            if any(s_file.endswith(tp) or tp.endswith(s_file) for tp in touched_normalized):
+                touched_nodes.add(nid)
+
+    perturbation_set: set[str] = set(touched_nodes)
+    for tn in touched_nodes:
+        for neighbor in adj.get(tn, {}):
+            perturbation_set.add(neighbor)
+
+    # If no nodes in perturbation set, return unchanged
+    if not perturbation_set:
+        return graph_data, []
+
+    # Calculate community sigma (total degree per community)
+    def _compute_sigma_tot(assignments: dict[str, int]) -> dict[int, float]:
+        sigma: dict[int, float] = {}
+        for nid, cid in assignments.items():
+            sigma[cid] = sigma.get(cid, 0.0) + degree.get(nid, 0.0)
+        return sigma
+
+    # Helper to evaluate delta Q for moving node u to community target_c
+    two_m = 2.0 * total_m
+    two_m_sq = two_m * two_m
+
+    def _calc_delta_q(u: str, target_c: int, sigma_tot: dict[int, float], curr_c: int, assignments: dict[str, int]) -> float:
+        # Degree of u
+        k_u = degree.get(u, 0.0)
+        if k_u == 0:
+            return 0.0
+        # Edge weight to target_c
+        k_u_c = sum(weight for v, weight in adj.get(u, {}).items() if assignments.get(v) == target_c and v != u)
+        s_tot = sigma_tot.get(target_c, 0.0)
+        if target_c == curr_c:
+            s_tot -= k_u
+        # Ratio of connections to target_c balanced by relative community mass
+        affinity = k_u_c / k_u
+        penalty = resolution * (s_tot / two_m)
+        return affinity - (0.5 * penalty)
+
+    # 4. Pass 1: Forward Sweep (Lexicographical order A -> Z)
+    p_fwd = sorted(perturbation_set)
+    comm_fwd = dict(initial_comm)
+    sigma_fwd = _compute_sigma_tot(comm_fwd)
+
+    for u in p_fwd:
+        curr_c = comm_fwd[u]
+        base_c = node_to_base_cid.get(u, curr_c)
+        k_u = degree.get(u, 0.0)
+
+        # Candidate communities: current, baseline, and all neighbor communities
+        candidate_cids = {curr_c, base_c}
+        for v in adj.get(u, {}):
+            candidate_cids.add(comm_fwd[v])
+
+        best_c = curr_c
+        best_dq = _calc_delta_q(u, curr_c, sigma_fwd, curr_c, comm_fwd)
+        base_dq = _calc_delta_q(u, base_c, sigma_fwd, curr_c, comm_fwd)
+
+        for cand in sorted(candidate_cids):
+            dq = _calc_delta_q(u, cand, sigma_fwd, curr_c, comm_fwd)
+            if dq > best_dq:
+                best_dq = dq
+                best_c = cand
+
+        # Apply inertia threshold relative to baseline
+        if best_c != base_c:
+            if (best_dq - base_dq) > inertia:
+                comm_fwd[u] = best_c
+                sigma_fwd[curr_c] -= k_u
+                sigma_fwd[best_c] = sigma_fwd.get(best_c, 0.0) + k_u
+            else:
+                comm_fwd[u] = base_c
+                if base_c != curr_c:
+                    sigma_fwd[curr_c] -= k_u
+                    sigma_fwd[base_c] = sigma_fwd.get(base_c, 0.0) + k_u
+
+    # 5. Pass 2: Reverse Sweep (Reverse Lexicographical order Z -> A)
+    p_rev = sorted(perturbation_set, reverse=True)
+    comm_rev = dict(initial_comm)
+    sigma_rev = _compute_sigma_tot(comm_rev)
+
+    for u in p_rev:
+        curr_c = comm_rev[u]
+        base_c = node_to_base_cid.get(u, curr_c)
+        k_u = degree.get(u, 0.0)
+
+        candidate_cids = {curr_c, base_c}
+        for v in adj.get(u, {}):
+            candidate_cids.add(comm_rev[v])
+
+        best_c = curr_c
+        best_dq = _calc_delta_q(u, curr_c, sigma_rev, curr_c, comm_rev)
+        base_dq = _calc_delta_q(u, base_c, sigma_rev, curr_c, comm_rev)
+
+        for cand in sorted(candidate_cids, reverse=True):
+            dq = _calc_delta_q(u, cand, sigma_rev, curr_c, comm_rev)
+            if dq > best_dq:
+                best_dq = dq
+                best_c = cand
+
+        if best_c != base_c:
+            if (best_dq - base_dq) > inertia:
+                comm_rev[u] = best_c
+                sigma_rev[curr_c] -= k_u
+                sigma_rev[best_c] = sigma_rev.get(best_c, 0.0) + k_u
+            else:
+                comm_rev[u] = base_c
+                if base_c != curr_c:
+                    sigma_rev[curr_c] -= k_u
+                    sigma_rev[base_c] = sigma_rev.get(base_c, 0.0) + k_u
+
+    # 6. Consensus Phase
+    border_ambiguities: list[dict[str, any]] = []
+
+    for u in sorted(perturbation_set):
+        c_fwd = comm_fwd[u]
+        c_rev = comm_rev[u]
+        base_c = node_to_base_cid.get(u)
+
+        if c_fwd == c_rev:
+            final_c = c_fwd
+        else:
+            # Order-sensitive disagreement: retain baseline, report ambiguity
+            final_c = base_c if base_c is not None else c_fwd
+            border_ambiguities.append({
+                "id": u,
+                "baselineSubsystem": cid_to_name.get(base_c, f"Community {base_c}") if base_c is not None else None,
+                "forwardCandidate": cid_to_name.get(c_fwd, f"Community {c_fwd}"),
+                "reverseCandidate": cid_to_name.get(c_rev, f"Community {c_rev}"),
+            })
+
+        node = nodes_by_id[u]
+        node["community"] = final_c
+        node["community_name"] = cid_to_name.get(final_c, f"Community {final_c}")
+
+    # Also update any new node in G outside perturbation_set (if any)
+    for nid, node in nodes_by_id.items():
+        if nid not in perturbation_set and "community" not in node:
+            final_c = initial_comm[nid]
+            node["community"] = final_c
+            node["community_name"] = cid_to_name.get(final_c, f"Community {final_c}")
+
+    return graph_data, border_ambiguities
+
