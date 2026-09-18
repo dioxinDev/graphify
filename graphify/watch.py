@@ -310,6 +310,85 @@ def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Pat
         return {"added": [], "modified": [], "deleted": [], "renamed": []}
 
 
+def _compute_ast_delta(old_graph: dict | None, new_graph: dict | None) -> dict[str, list[str]]:
+    """Compute added/removed symbols and edges between old and new graph dicts."""
+    old_graph = old_graph or {"nodes": [], "edges": []}
+    new_graph = new_graph or {"nodes": [], "edges": []}
+
+    old_nodes = {str(n.get("id")): n for n in old_graph.get("nodes", [])}
+    new_nodes = {str(n.get("id")): n for n in new_graph.get("nodes", [])}
+
+    old_node_ids = set(old_nodes.keys())
+    new_node_ids = set(new_nodes.keys())
+
+    added_ids = new_node_ids - old_node_ids
+    removed_ids = old_node_ids - new_node_ids
+
+    added_symbols = [new_nodes[nid].get("label", nid) for nid in added_ids if nid in new_nodes]
+    removed_symbols = [old_nodes[nid].get("label", nid) for nid in removed_ids if nid in old_nodes]
+
+    def _edge_key(e):
+        return (str(e.get("source", "")), str(e.get("target", "")), str(e.get("type", "link")))
+
+    old_edges = {_edge_key(e): e for e in old_graph.get("edges", [])}
+    new_edges = {_edge_key(e): e for e in new_graph.get("edges", [])}
+
+    added_edges_keys = set(new_edges.keys()) - set(old_edges.keys())
+    removed_edges_keys = set(old_edges.keys()) - set(new_edges.keys())
+
+    added_edges = [f"{e[0]} -> {e[1]} ({e[2]})" for e in added_edges_keys]
+    removed_edges = [f"{e[0]} -> {e[1]} ({e[2]})" for e in removed_edges_keys]
+
+    return {
+        "addedSymbols": sorted(added_symbols),
+        "removedSymbols": sorted(removed_symbols),
+        "addedEdges": sorted(added_edges),
+        "removedEdges": sorted(removed_edges),
+    }
+
+
+def _compute_blast_radius(graph_data: dict | None, changed_node_ids: list[str]) -> dict[str, list[str]]:
+    """Compute direct and indirect downstream impacted symbols using NetworkX graph traversal."""
+    if not graph_data:
+        return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
+    
+    try:
+        import networkx as nx
+        from graphify.paths import load_node_link_graph
+        G = load_node_link_graph(graph_data)
+        if not G or not G.number_of_nodes():
+            return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
+        
+        direct = set()
+        indirect = set()
+        subsystems = set()
+
+        for seed in changed_node_ids:
+            if seed in G:
+                succ = list(G.successors(seed)) if hasattr(G, "successors") else list(G.neighbors(seed))
+                for s in succ:
+                    direct.add(s)
+                    node_data = G.nodes[s]
+                    if "community_name" in node_data:
+                        subsystems.add(node_data["community_name"])
+                    if hasattr(nx, "descendants"):
+                        desc = nx.descendants(G, s)
+                        for d in desc:
+                            if d not in direct and d != seed:
+                                indirect.add(d)
+                                d_data = G.nodes[d]
+                                if "community_name" in d_data:
+                                    subsystems.add(d_data["community_name"])
+        
+        return {
+            "directDownstream": sorted(list(direct)),
+            "indirectDownstream": sorted(list(indirect)),
+            "impactedSubsystems": sorted(list(subsystems))
+        }
+    except Exception:
+        return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
+
+
 from graphify.detect import (
     CODE_EXTENSIONS,
     DOC_EXTENSIONS,

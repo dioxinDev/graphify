@@ -2465,20 +2465,45 @@ def dispatch_command(cmd: str) -> None:
         head = sys.argv[3] if len(sys.argv) > 3 else None
         saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
         watch_path = Path(saved.read_text(encoding="utf-8-sig").strip()) if saved.exists() else Path(".")
-        from graphify.watch import _git_diff_changes, _rebuild_code
+        from graphify.watch import _git_diff_changes, _rebuild_code, _compute_ast_delta, _compute_blast_radius
         changes = _git_diff_changes(base, head, watch_path)
         print("Git Diff Changes:", json.dumps(changes, indent=2))
+
+        graph_json_path = watch_path / _GRAPHIFY_OUT / "graph.json"
+        old_graph = json.loads(graph_json_path.read_text(encoding="utf-8-sig")) if graph_json_path.exists() else None
+
         touched = [watch_path / p for p in changes["added"] + changes["modified"]]
         if touched:
             print(f"Re-extracting {len(touched)} changed files incrementally...")
             ok = _rebuild_code(watch_path, changed_paths=touched, force=False, no_cluster=True, block_on_lock=True)
-            if ok:
-                print("Incremental git-diff graph update complete.")
-            else:
+            if not ok:
                 print("Incremental git-diff rebuild failed.", file=sys.stderr)
                 sys.exit(1)
+            print("Incremental git-diff graph update complete.")
         else:
             print("No code changes detected in git diff.")
+
+        new_graph = json.loads(graph_json_path.read_text(encoding="utf-8-sig")) if graph_json_path.exists() else None
+        ast_delta = _compute_ast_delta(old_graph, new_graph)
+        changed_seeds = ast_delta["addedSymbols"] + ast_delta["removedSymbols"]
+        blast_radius = _compute_blast_radius(new_graph, changed_seeds)
+
+        delta_data = {
+            "version": "1.0.0",
+            "baseCommit": base or "HEAD~1",
+            "headCommit": head or "HEAD",
+            "changes": {
+                "filesAdded": changes["added"],
+                "filesModified": changes["modified"],
+                "filesDeleted": changes["deleted"]
+            },
+            "astDelta": ast_delta,
+            "blastRadius": blast_radius
+        }
+        delta_path = watch_path / _GRAPHIFY_OUT / "pacre-delta.json"
+        delta_path.parent.mkdir(parents=True, exist_ok=True)
+        delta_path.write_text(json.dumps(delta_data, indent=2), encoding="utf-8")
+        print(f"Emitted enriched PACRE delta contract to {delta_path}")
         sys.exit(0)
 
     elif cmd == "hook-check":
