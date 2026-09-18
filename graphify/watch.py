@@ -270,48 +270,75 @@ def _git_head(cwd: Path | str | None = None) -> str | None:
         return None
 
 
-def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Path | str | None = None) -> dict[str, list[str]]:
-    """Return categorized file changes (added, modified, deleted, renamed) from git diff."""
+def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Path | str | None = None) -> dict[str, list[str | dict[str, str]]]:
+    """Return categorized file changes (added, modified, deleted, renamed) from git diff using -z NUL delimiters."""
     import subprocess as _sp
-    cmd = ["git", "diff", "--name-status"]
-    if base:
-        if head:
-            cmd.extend([base, head])
-        else:
-            cmd.append(base)
+    cmd = ["git", "diff", "-z", "--name-status"]
+    if base and head:
+        cmd.extend([base, head])
+    elif base:
+        cmd.append(base)
+    elif head:
+        cmd.append(head)
+
     try:
         r = _sp.run(
-            cmd, capture_output=True, text=True, timeout=5,
+            cmd, capture_output=True, timeout=5,
             cwd=str(cwd) if cwd is not None else None,
         )
         if r.returncode != 0:
             return {"added": [], "modified": [], "deleted": [], "renamed": []}
-        
-        added = []
-        modified = []
-        deleted = []
-        renamed = []
-        for line in r.stdout.splitlines():
-            parts = line.split("\t")
-            if not parts:
+
+        tokens = r.stdout.decode("utf-8", errors="replace").split("\0")
+        if tokens and tokens[-1] == "":
+            tokens.pop()
+
+        added: list[str] = []
+        modified: list[str] = []
+        deleted: list[str] = []
+        renamed: list[dict[str, str]] = []
+
+        i = 0
+        while i < len(tokens):
+            status_field = tokens[i]
+            if not status_field:
+                i += 1
                 continue
-            status = parts[0][0]
-            if status == "A" and len(parts) >= 2:
-                added.append(parts[1])
-            elif status == "M" and len(parts) >= 2:
-                modified.append(parts[1])
-            elif status == "D" and len(parts) >= 2:
-                deleted.append(parts[1])
-            elif status == "R" and len(parts) >= 3:
-                deleted.append(parts[1])
-                added.append(parts[2])
+            status = status_field[0]
+            if status in ("R", "C"):
+                if i + 2 < len(tokens):
+                    old_path, new_path = tokens[i + 1], tokens[i + 2]
+                    if status == "R":
+                        renamed.append({"old": old_path, "new": new_path})
+                    else:
+                        added.append(new_path)
+                    i += 3
+                else:
+                    break
+            else:
+                if i + 1 < len(tokens):
+                    path = tokens[i + 1]
+                    if status == "A":
+                        added.append(path)
+                    elif status in ("M", "T", "U"):
+                        # 'U' unmerged conflict, 'T' type change, 'M' modified
+                        modified.append(path)
+                    elif status == "D":
+                        deleted.append(path)
+                    else:
+                        # Unknown status codes (e.g. 'X') - treat as modified so they are re-extracted
+                        modified.append(path)
+                    i += 2
+                else:
+                    break
+
         return {"added": added, "modified": modified, "deleted": deleted, "renamed": renamed}
     except Exception:
         return {"added": [], "modified": [], "deleted": [], "renamed": []}
 
 
-def _compute_ast_delta(old_graph: dict | None, new_graph: dict | None) -> dict[str, list[str]]:
-    """Compute added/removed symbols and edges between old and new graph dicts."""
+def _compute_ast_delta(old_graph: dict | None, new_graph: dict | None) -> dict[str, list[dict[str, any]]]:
+    """Compute added/removed symbols and edges matching the PACRE contract schema."""
     old_graph = old_graph or {"nodes": [], "edges": []}
     new_graph = new_graph or {"nodes": [], "edges": []}
 
@@ -324,69 +351,116 @@ def _compute_ast_delta(old_graph: dict | None, new_graph: dict | None) -> dict[s
     added_ids = new_node_ids - old_node_ids
     removed_ids = old_node_ids - new_node_ids
 
-    added_symbols = [new_nodes[nid].get("label", nid) for nid in added_ids if nid in new_nodes]
-    removed_symbols = [old_nodes[nid].get("label", nid) for nid in removed_ids if nid in old_nodes]
+    added_symbols: list[dict[str, any]] = []
+    for nid in added_ids:
+        node = new_nodes.get(nid, {})
+        sym: dict[str, any] = {
+            "id": nid,
+            "type": node.get("type") or node.get("kind") or "symbol",
+        }
+        if "line" in node and node["line"] is not None:
+            sym["line"] = node["line"]
+        if "file" in node and node["file"]:
+            sym["file"] = node["file"]
+        added_symbols.append(sym)
+    added_symbols.sort(key=lambda s: str(s["id"]))
+
+    removed_symbols: list[dict[str, any]] = []
+    for nid in removed_ids:
+        node = old_nodes.get(nid, {})
+        sym = {
+            "id": nid,
+            "type": node.get("type") or node.get("kind") or "symbol",
+        }
+        if "file" in node and node["file"]:
+            sym["file"] = node["file"]
+        removed_symbols.append(sym)
+    removed_symbols.sort(key=lambda s: str(s["id"]))
 
     def _edge_key(e):
-        return (str(e.get("source", "")), str(e.get("target", "")), str(e.get("type", "link")))
+        return (str(e.get("source", "")), str(e.get("target", "")), str(e.get("type") or e.get("relation") or "link"))
 
-    old_edges = {_edge_key(e): e for e in old_graph.get("edges", [])}
-    new_edges = {_edge_key(e): e for e in new_graph.get("edges", [])}
+    old_edges_list = old_graph.get("edges") or old_graph.get("links") or []
+    new_edges_list = new_graph.get("edges") or new_graph.get("links") or []
+
+    old_edges = {_edge_key(e): e for e in old_edges_list}
+    new_edges = {_edge_key(e): e for e in new_edges_list}
 
     added_edges_keys = set(new_edges.keys()) - set(old_edges.keys())
     removed_edges_keys = set(old_edges.keys()) - set(new_edges.keys())
 
-    added_edges = [f"{e[0]} -> {e[1]} ({e[2]})" for e in added_edges_keys]
-    removed_edges = [f"{e[0]} -> {e[1]} ({e[2]})" for e in removed_edges_keys]
+    added_edges = [
+        {
+            "source": str(new_edges[k].get("source", "")),
+            "target": str(new_edges[k].get("target", "")),
+            "relation": str(new_edges[k].get("type") or new_edges[k].get("relation") or "link"),
+        }
+        for k in sorted(added_edges_keys)
+    ]
+
+    removed_edges = [
+        {
+            "source": str(old_edges[k].get("source", "")),
+            "target": str(old_edges[k].get("target", "")),
+            "relation": str(old_edges[k].get("type") or old_edges[k].get("relation") or "link"),
+        }
+        for k in sorted(removed_edges_keys)
+    ]
 
     return {
-        "addedSymbols": sorted(added_symbols),
-        "removedSymbols": sorted(removed_symbols),
-        "addedEdges": sorted(added_edges),
-        "removedEdges": sorted(removed_edges),
+        "addedSymbols": added_symbols,
+        "removedSymbols": removed_symbols,
+        "addedEdges": added_edges,
+        "removedEdges": removed_edges,
     }
 
 
 def _compute_blast_radius(graph_data: dict | None, changed_node_ids: list[str]) -> dict[str, list[str]]:
-    """Compute direct and indirect downstream impacted symbols using NetworkX graph traversal."""
-    if not graph_data:
+    """Compute direct and indirect downstream impacted symbols using pure-Python graph traversal."""
+    if not graph_data or not changed_node_ids:
         return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
-    
-    try:
-        import networkx as nx
-        from graphify.paths import load_node_link_graph
-        G = load_node_link_graph(graph_data)
-        if not G or not G.number_of_nodes():
-            return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
-        
-        direct = set()
-        indirect = set()
-        subsystems = set()
 
-        for seed in changed_node_ids:
-            if seed in G:
-                succ = list(G.successors(seed)) if hasattr(G, "successors") else list(G.neighbors(seed))
-                for s in succ:
-                    direct.add(s)
-                    node_data = G.nodes[s]
-                    if "community_name" in node_data:
-                        subsystems.add(node_data["community_name"])
-                    if hasattr(nx, "descendants"):
-                        desc = nx.descendants(G, s)
-                        for d in desc:
-                            if d not in direct and d != seed:
-                                indirect.add(d)
-                                d_data = G.nodes[d]
-                                if "community_name" in d_data:
-                                    subsystems.add(d_data["community_name"])
-        
-        return {
-            "directDownstream": sorted(list(direct)),
-            "indirectDownstream": sorted(list(indirect)),
-            "impactedSubsystems": sorted(list(subsystems))
-        }
-    except Exception:
-        return {"directDownstream": [], "indirectDownstream": [], "impactedSubsystems": []}
+    nodes = {str(n.get("id")): n for n in graph_data.get("nodes", [])}
+    edges = graph_data.get("edges") or graph_data.get("links") or []
+
+    adj: dict[str, set[str]] = {}
+    for e in edges:
+        s = str(e.get("source", ""))
+        t = str(e.get("target", ""))
+        if s and t:
+            adj.setdefault(s, set()).add(t)
+
+    seed_set = set(changed_node_ids)
+    direct: set[str] = set()
+    for seed in seed_set:
+        for target in adj.get(seed, set()):
+            if target not in seed_set:
+                direct.add(target)
+
+    indirect: set[str] = set()
+    queue = list(direct)
+    visited = set(direct) | seed_set
+
+    while queue:
+        curr = queue.pop(0)
+        for nxt in adj.get(curr, set()):
+            if nxt not in visited:
+                visited.add(nxt)
+                indirect.add(nxt)
+                queue.append(nxt)
+
+    subsystems: set[str] = set()
+    for nid in direct | indirect:
+        node = nodes.get(nid, {})
+        comm = node.get("community_name") or node.get("community")
+        if comm:
+            subsystems.add(str(comm))
+
+    return {
+        "directDownstream": sorted(list(direct)),
+        "indirectDownstream": sorted(list(indirect)),
+        "impactedSubsystems": sorted(list(subsystems)),
+    }
 
 
 from graphify.detect import (

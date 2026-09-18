@@ -2472,7 +2472,9 @@ def dispatch_command(cmd: str) -> None:
         graph_json_path = watch_path / _GRAPHIFY_OUT / "graph.json"
         old_graph = json.loads(graph_json_path.read_text(encoding="utf-8-sig")) if graph_json_path.exists() else None
 
-        touched = [watch_path / p for p in changes["added"] + changes["modified"]]
+        renamed_new = [r["new"] for r in changes.get("renamed", [])]
+        renamed_old = [r["old"] for r in changes.get("renamed", [])]
+        touched = [watch_path / p for p in changes["added"] + changes["modified"] + renamed_new]
         if touched:
             print(f"Re-extracting {len(touched)} changed files incrementally...")
             ok = _rebuild_code(watch_path, changed_paths=touched, force=False, no_cluster=True, block_on_lock=True)
@@ -2485,7 +2487,7 @@ def dispatch_command(cmd: str) -> None:
 
         new_graph = json.loads(graph_json_path.read_text(encoding="utf-8-sig")) if graph_json_path.exists() else None
         ast_delta = _compute_ast_delta(old_graph, new_graph)
-        changed_seeds = ast_delta["addedSymbols"] + ast_delta["removedSymbols"]
+        changed_seeds = [s["id"] for s in ast_delta["addedSymbols"]] + [s["id"] for s in ast_delta["removedSymbols"]]
         blast_radius = _compute_blast_radius(new_graph, changed_seeds)
 
         delta_data = {
@@ -2493,9 +2495,10 @@ def dispatch_command(cmd: str) -> None:
             "baseCommit": base or "HEAD~1",
             "headCommit": head or "HEAD",
             "changes": {
-                "filesAdded": changes["added"],
+                "filesAdded": changes["added"] + renamed_new,
                 "filesModified": changes["modified"],
-                "filesDeleted": changes["deleted"]
+                "filesDeleted": changes["deleted"] + renamed_old,
+                "filesRenamed": changes.get("renamed", [])
             },
             "astDelta": ast_delta,
             "blastRadius": blast_radius
