@@ -270,6 +270,46 @@ def _git_head(cwd: Path | str | None = None) -> str | None:
         return None
 
 
+def _git_diff_changes(base: str | None = None, head: str | None = None, cwd: Path | str | None = None) -> dict[str, list[str]]:
+    """Return categorized file changes (added, modified, deleted, renamed) from git diff."""
+    import subprocess as _sp
+    cmd = ["git", "diff", "--name-status"]
+    if base:
+        if head:
+            cmd.extend([base, head])
+        else:
+            cmd.append(base)
+    try:
+        r = _sp.run(
+            cmd, capture_output=True, text=True, timeout=5,
+            cwd=str(cwd) if cwd is not None else None,
+        )
+        if r.returncode != 0:
+            return {"added": [], "modified": [], "deleted": [], "renamed": []}
+        
+        added = []
+        modified = []
+        deleted = []
+        renamed = []
+        for line in r.stdout.splitlines():
+            parts = line.split("\t")
+            if not parts:
+                continue
+            status = parts[0][0]
+            if status == "A" and len(parts) >= 2:
+                added.append(parts[1])
+            elif status == "M" and len(parts) >= 2:
+                modified.append(parts[1])
+            elif status == "D" and len(parts) >= 2:
+                deleted.append(parts[1])
+            elif status == "R" and len(parts) >= 3:
+                deleted.append(parts[1])
+                added.append(parts[2])
+        return {"added": added, "modified": modified, "deleted": deleted, "renamed": renamed}
+    except Exception:
+        return {"added": [], "modified": [], "deleted": [], "renamed": []}
+
+
 from graphify.detect import (
     CODE_EXTENSIONS,
     DOC_EXTENSIONS,

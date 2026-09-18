@@ -2460,6 +2460,27 @@ def dispatch_command(cmd: str) -> None:
             )
             sys.exit(1)
 
+    elif cmd == "diff":
+        base = sys.argv[2] if len(sys.argv) > 2 else None
+        head = sys.argv[3] if len(sys.argv) > 3 else None
+        saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
+        watch_path = Path(saved.read_text(encoding="utf-8-sig").strip()) if saved.exists() else Path(".")
+        from graphify.watch import _git_diff_changes, _rebuild_code
+        changes = _git_diff_changes(base, head, watch_path)
+        print("Git Diff Changes:", json.dumps(changes, indent=2))
+        touched = [watch_path / p for p in changes["added"] + changes["modified"]]
+        if touched:
+            print(f"Re-extracting {len(touched)} changed files incrementally...")
+            ok = _rebuild_code(watch_path, changed_paths=touched, force=False, no_cluster=True, block_on_lock=True)
+            if ok:
+                print("Incremental git-diff graph update complete.")
+            else:
+                print("Incremental git-diff rebuild failed.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("No code changes detected in git diff.")
+        sys.exit(0)
+
     elif cmd == "hook-check":
         # Codex Desktop rejects hookSpecificOutput.additionalContext on PreToolUse.
         # Keep this as a cross-platform no-op so installed hooks never break Bash
